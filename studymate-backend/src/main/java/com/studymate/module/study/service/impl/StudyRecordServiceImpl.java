@@ -1,9 +1,14 @@
 package com.studymate.module.study.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.studymate.common.exception.BusinessException;
 import com.studymate.enums.ResultCode;
 import com.studymate.module.study.dto.StudyRecordCreateDTO;
+import com.studymate.module.study.dto.StudyRecordQueryDTO;
+import com.studymate.module.study.dto.StudyRecordUpdateDTO;
 import com.studymate.module.study.entity.StudyRecord;
 import com.studymate.module.study.entity.StudyRecordCategory;
 import com.studymate.module.study.entity.WeakPoint;
@@ -12,6 +17,7 @@ import com.studymate.module.study.mapper.StudyRecordMapper;
 import com.studymate.module.study.mapper.WeakPointMapper;
 import com.studymate.module.study.service.StudyRecordService;
 import com.studymate.module.study.vo.StudyRecordDetailVO;
+import com.studymate.module.study.vo.StudyRecordVO;
 import com.studymate.security.SecurityUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -58,11 +64,88 @@ public class StudyRecordServiceImpl implements StudyRecordService {
         return toDetailVO(studyRecord, savedCategories, savedWeakPoints);
     }
 
+    @Override
+    public IPage<StudyRecordVO> listStudyRecords(StudyRecordQueryDTO queryDTO) {
+        Long currentUserId = SecurityUtils.getCurrentUserId();
+        StudyRecordQueryDTO safeQuery = queryDTO == null ? new StudyRecordQueryDTO() : queryDTO;
+        Page<StudyRecord> page = new Page<>(safeQuery.getPageNum(), safeQuery.getPageSize());
+
+        LambdaQueryWrapper<StudyRecord> queryWrapper = new LambdaQueryWrapper<StudyRecord>()
+                .eq(StudyRecord::getUserId, currentUserId)
+                .eq(StudyRecord::getDeleted, NOT_DELETED)
+                .eq(safeQuery.getRecordDate() != null, StudyRecord::getRecordDate, safeQuery.getRecordDate())
+                .eq(hasText(safeQuery.getEmotionStatus()), StudyRecord::getEmotionStatus, trim(safeQuery.getEmotionStatus()))
+                .apply(hasText(safeQuery.getCategoryName()),
+                        """
+                                EXISTS (
+                                    SELECT 1
+                                    FROM study_record_category src
+                                    INNER JOIN study_category sc ON src.category_id = sc.id
+                                    WHERE src.study_record_id = study_record.id
+                                      AND src.user_id = {0}
+                                      AND sc.name = {1}
+                                      AND sc.status = 1
+                                )
+                                """,
+                        currentUserId,
+                        trim(safeQuery.getCategoryName()))
+                .orderByDesc(StudyRecord::getRecordDate)
+                .orderByDesc(StudyRecord::getCreateTime);
+
+        IPage<StudyRecord> recordPage = studyRecordMapper.selectPage(page, queryWrapper);
+        Page<StudyRecordVO> voPage = new Page<>(recordPage.getCurrent(), recordPage.getSize(), recordPage.getTotal());
+        voPage.setRecords(recordPage.getRecords().stream()
+                .map(record -> toListVO(record, loadCategories(record.getId(), currentUserId)))
+                .toList());
+        return voPage;
+    }
+
+    @Override
+    public StudyRecordDetailVO getStudyRecordDetail(Long id) {
+        Long currentUserId = SecurityUtils.getCurrentUserId();
+        StudyRecord studyRecord = getOwnedActiveRecord(id, currentUserId);
+        return toDetailVO(studyRecord, loadCategories(id, currentUserId), loadWeakPoints(id, currentUserId));
+    }
+
+    @Override
+    @Transactional
+    public StudyRecordDetailVO updateStudyRecord(Long id, StudyRecordUpdateDTO updateDTO) {
+        Long currentUserId = SecurityUtils.getCurrentUserId();
+        StudyRecord studyRecord = getOwnedActiveRecord(id, currentUserId);
+        LocalDateTime now = LocalDateTime.now();
+
+        applyUpdate(studyRecord, updateDTO, now);
+        studyRecordMapper.updateById(studyRecord);
+
+        rebuildCategories(currentUserId, id, updateDTO.getCategories(), now);
+        rebuildWeakPoints(currentUserId, id, updateDTO.getWeakPoints(), now);
+
+        return getStudyRecordDetail(id);
+    }
+
+    @Override
+    @Transactional
+    public void deleteStudyRecord(Long id) {
+        Long currentUserId = SecurityUtils.getCurrentUserId();
+        getOwnedActiveRecord(id, currentUserId);
+        LocalDateTime now = LocalDateTime.now();
+
+        studyRecordMapper.update(null, new UpdateWrapper<StudyRecord>()
+                .eq("id", id)
+                .eq("user_id", currentUserId)
+                .eq("deleted", NOT_DELETED)
+                .set("deleted", 1)
+                .set("update_time", now));
+        removeWeakPoints(currentUserId, id);
+        removeCategories(currentUserId, id);
+    }
+
     private void rejectDuplicate(Long currentUserId, StudyRecordCreateDTO createDTO) {
         StudyRecord existing = studyRecordMapper.selectOne(new LambdaQueryWrapper<StudyRecord>()
                 .eq(StudyRecord::getUserId, currentUserId)
                 .eq(StudyRecord::getRecordDate, createDTO.getRecordDate())
                 .eq(StudyRecord::getRawContent, createDTO.getRawContent())
+                .eq(StudyRecord::getDeleted, NOT_DELETED)
                 .last("LIMIT 1"));
         if (existing != null) {
             throw new BusinessException(ResultCode.PARAM_ERROR, "Study record already exists");
@@ -122,6 +205,62 @@ public class StudyRecordServiceImpl implements StudyRecordService {
         return savedWeakPoints;
     }
 
+    private void rebuildCategories(Long currentUserId, Long studyRecordId, List<String> categories, LocalDateTime now) {
+        removeCategories(currentUserId, studyRecordId);
+        saveCategories(currentUserId, studyRecordId, categories, now);
+    }
+
+    private void rebuildWeakPoints(Long currentUserId, Long studyRecordId, List<String> weakPoints, LocalDateTime now) {
+        removeWeakPoints(currentUserId, studyRecordId);
+        saveWeakPoints(currentUserId, studyRecordId, weakPoints, now);
+    }
+
+    private void removeCategories(Long currentUserId, Long studyRecordId) {
+        studyRecordCategoryMapper.delete(new LambdaQueryWrapper<StudyRecordCategory>()
+                .eq(StudyRecordCategory::getStudyRecordId, studyRecordId)
+                .eq(StudyRecordCategory::getUserId, currentUserId));
+    }
+
+    private void removeWeakPoints(Long currentUserId, Long studyRecordId) {
+        weakPointMapper.delete(new LambdaQueryWrapper<WeakPoint>()
+                .eq(WeakPoint::getStudyRecordId, studyRecordId)
+                .eq(WeakPoint::getUserId, currentUserId)
+                .eq(WeakPoint::getDeleted, NOT_DELETED));
+    }
+
+    private StudyRecord getOwnedActiveRecord(Long id, Long currentUserId) {
+        StudyRecord studyRecord = studyRecordMapper.selectOne(new LambdaQueryWrapper<StudyRecord>()
+                .eq(StudyRecord::getId, id)
+                .eq(StudyRecord::getUserId, currentUserId)
+                .eq(StudyRecord::getDeleted, NOT_DELETED)
+                .last("LIMIT 1"));
+        if (studyRecord == null) {
+            throw new BusinessException(ResultCode.NOT_FOUND, "Study record not found");
+        }
+        return studyRecord;
+    }
+
+    private void applyUpdate(StudyRecord studyRecord, StudyRecordUpdateDTO updateDTO, LocalDateTime now) {
+        studyRecord.setRecordDate(updateDTO.getRecordDate());
+        studyRecord.setRawContent(updateDTO.getRawContent());
+        studyRecord.setDurationMinutes(updateDTO.getDurationMinutes() == null ? DEFAULT_DURATION_MINUTES : updateDTO.getDurationMinutes());
+        studyRecord.setStudyContent(updateDTO.getStudyContent());
+        studyRecord.setEmotionStatus(updateDTO.getEmotionStatus());
+        studyRecord.setTomorrowPlan(updateDTO.getTomorrowPlan());
+        studyRecord.setAiSummary(updateDTO.getAiSummary());
+        studyRecord.setAiComfort(updateDTO.getAiComfort());
+        studyRecord.setRemark(updateDTO.getRemark());
+        studyRecord.setUpdateTime(now);
+    }
+
+    private List<String> loadCategories(Long studyRecordId, Long currentUserId) {
+        return studyRecordCategoryMapper.selectCategoryNamesByRecordId(studyRecordId, currentUserId);
+    }
+
+    private List<String> loadWeakPoints(Long studyRecordId, Long currentUserId) {
+        return weakPointMapper.selectContentsByRecordId(studyRecordId, currentUserId);
+    }
+
     private Set<String> normalize(List<String> values) {
         Set<String> normalized = new LinkedHashSet<>();
         if (values == null) {
@@ -134,6 +273,27 @@ public class StudyRecordServiceImpl implements StudyRecordService {
             normalized.add(value.trim());
         }
         return normalized;
+    }
+
+    private boolean hasText(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    private String trim(String value) {
+        return value == null ? null : value.trim();
+    }
+
+    private StudyRecordVO toListVO(StudyRecord studyRecord, List<String> categories) {
+        StudyRecordVO recordVO = new StudyRecordVO();
+        recordVO.setId(studyRecord.getId());
+        recordVO.setRecordDate(studyRecord.getRecordDate());
+        recordVO.setDurationMinutes(studyRecord.getDurationMinutes());
+        recordVO.setStudyContent(studyRecord.getStudyContent());
+        recordVO.setCategories(categories);
+        recordVO.setEmotionStatus(studyRecord.getEmotionStatus());
+        recordVO.setAiSummary(studyRecord.getAiSummary());
+        recordVO.setCreateTime(studyRecord.getCreateTime());
+        return recordVO;
     }
 
     private StudyRecordDetailVO toDetailVO(StudyRecord studyRecord, List<String> categories, List<String> weakPoints) {

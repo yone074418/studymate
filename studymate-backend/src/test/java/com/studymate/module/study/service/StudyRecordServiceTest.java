@@ -2,6 +2,8 @@ package com.studymate.module.study.service;
 
 import com.studymate.common.exception.BusinessException;
 import com.studymate.module.study.dto.StudyRecordCreateDTO;
+import com.studymate.module.study.dto.StudyRecordQueryDTO;
+import com.studymate.module.study.dto.StudyRecordUpdateDTO;
 import com.studymate.module.study.entity.StudyRecord;
 import com.studymate.module.study.entity.StudyRecordCategory;
 import com.studymate.module.study.entity.WeakPoint;
@@ -10,7 +12,9 @@ import com.studymate.module.study.mapper.StudyRecordMapper;
 import com.studymate.module.study.mapper.WeakPointMapper;
 import com.studymate.module.study.service.impl.StudyRecordServiceImpl;
 import com.studymate.module.study.vo.StudyRecordDetailVO;
+import com.studymate.module.study.vo.StudyRecordVO;
 import com.studymate.security.LoginUser;
+import com.baomidou.mybatisplus.core.metadata.IPage;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -19,6 +23,7 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.context.SecurityContextHolder;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -31,6 +36,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.when;
 
 class StudyRecordServiceTest {
@@ -187,6 +193,121 @@ class StudyRecordServiceTest {
         assertThat(recordCaptor.getValue().getUserId()).isEqualTo(7L);
     }
 
+    @Test
+    void listReturnsCurrentUsersNotDeletedRecordsWithCategories() {
+        StudyRecord record = savedRecord(51L, 7L);
+        when(studyRecordMapper.selectPage(any(), any())).thenAnswer(invocation -> {
+            IPage<StudyRecord> page = invocation.getArgument(0);
+            page.setRecords(List.of(record));
+            page.setTotal(1);
+            return page;
+        });
+        when(studyRecordCategoryMapper.selectCategoryNamesByRecordId(51L, 7L)).thenReturn(List.of("Redis"));
+
+        IPage<StudyRecordVO> result = studyRecordService.listStudyRecords(new StudyRecordQueryDTO());
+
+        assertThat(result.getTotal()).isEqualTo(1);
+        assertThat(result.getRecords()).hasSize(1);
+        assertThat(result.getRecords().get(0).getId()).isEqualTo(51L);
+        assertThat(result.getRecords().get(0).getCategories()).containsExactly("Redis");
+        verify(studyRecordMapper).selectPage(any(), any());
+    }
+
+    @Test
+    void detailReturnsCurrentUsersRecordWithCategoriesAndWeakPoints() {
+        StudyRecord record = savedRecord(61L, 7L);
+        when(studyRecordMapper.selectOne(any())).thenReturn(record);
+        when(studyRecordCategoryMapper.selectCategoryNamesByRecordId(61L, 7L)).thenReturn(List.of("Redis"));
+        when(weakPointMapper.selectContentsByRecordId(61L, 7L)).thenReturn(List.of("AOF"));
+
+        StudyRecordDetailVO result = studyRecordService.getStudyRecordDetail(61L);
+
+        assertThat(result.getId()).isEqualTo(61L);
+        assertThat(result.getCategories()).containsExactly("Redis");
+        assertThat(result.getWeakPoints()).containsExactly("AOF");
+    }
+
+    @Test
+    void detailRejectsMissingOrOtherUsersRecord() {
+        when(studyRecordMapper.selectOne(any())).thenReturn(null);
+
+        assertThatThrownBy(() -> studyRecordService.getStudyRecordDetail(999L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Study record not found");
+    }
+
+    @Test
+    void updateCurrentUsersRecordAndRebuildsCategoriesAndWeakPoints() {
+        StudyRecord existing = savedRecord(71L, 7L);
+        when(studyRecordMapper.selectOne(any())).thenReturn(existing);
+        when(studyRecordMapper.updateById(any(StudyRecord.class))).thenReturn(1);
+        when(studyRecordCategoryMapper.selectCategoryIdByName("Redis")).thenReturn(4L);
+        when(studyRecordCategoryMapper.selectCategoryIdByName("Unknown")).thenReturn(null);
+        when(studyRecordCategoryMapper.selectCategoryNamesByRecordId(71L, 7L)).thenReturn(List.of("Redis"));
+        when(weakPointMapper.selectContentsByRecordId(71L, 7L)).thenReturn(List.of("New weak point"));
+
+        StudyRecordUpdateDTO request = buildUpdateRequest();
+        StudyRecordDetailVO result = studyRecordService.updateStudyRecord(71L, request);
+
+        assertThat(result.getCategories()).containsExactly("Redis");
+        assertThat(result.getWeakPoints()).containsExactly("New weak point");
+        ArgumentCaptor<StudyRecord> recordCaptor = ArgumentCaptor.forClass(StudyRecord.class);
+        verify(studyRecordMapper).updateById(recordCaptor.capture());
+        assertThat(recordCaptor.getValue().getId()).isEqualTo(71L);
+        assertThat(recordCaptor.getValue().getUserId()).isEqualTo(7L);
+        assertThat(recordCaptor.getValue().getRawContent()).isEqualTo("updated content");
+        verify(studyRecordCategoryMapper).delete(any());
+        verify(studyRecordCategoryMapper).insert(any(StudyRecordCategory.class));
+        verify(weakPointMapper).delete(any());
+        verify(weakPointMapper).insert(any(WeakPoint.class));
+    }
+
+    @Test
+    void updateRejectsMissingOrOtherUsersRecord() {
+        when(studyRecordMapper.selectOne(any())).thenReturn(null);
+
+        assertThatThrownBy(() -> studyRecordService.updateStudyRecord(999L, buildUpdateRequest()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Study record not found");
+        verify(studyRecordMapper, never()).updateById(any(StudyRecord.class));
+    }
+
+    @Test
+    void deleteCurrentUsersRecordLogicallyAndRemovesRelatedDataFromStatistics() {
+        StudyRecord existing = savedRecord(81L, 7L);
+        when(studyRecordMapper.selectOne(any())).thenReturn(existing);
+        when(studyRecordMapper.update(any(), any())).thenReturn(1);
+
+        studyRecordService.deleteStudyRecord(81L);
+
+        verify(studyRecordMapper).update(any(), any());
+        verify(weakPointMapper).delete(any());
+        verify(studyRecordCategoryMapper).delete(any());
+    }
+
+    @Test
+    void deleteRejectsMissingOrOtherUsersRecord() {
+        when(studyRecordMapper.selectOne(any())).thenReturn(null);
+
+        assertThatThrownBy(() -> studyRecordService.deleteStudyRecord(999L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("Study record not found");
+        verify(studyRecordMapper, never()).update(any(), any());
+    }
+
+    @Test
+    void allReadAndWriteOperationsQueryByCurrentUser() {
+        when(studyRecordMapper.selectOne(any())).thenReturn(savedRecord(91L, 7L));
+        when(studyRecordMapper.updateById(any(StudyRecord.class))).thenReturn(1);
+        when(studyRecordMapper.update(any(), any())).thenReturn(1);
+
+        studyRecordService.getStudyRecordDetail(91L);
+        studyRecordService.updateStudyRecord(91L, buildUpdateRequest());
+        studyRecordService.deleteStudyRecord(91L);
+
+        verify(studyRecordMapper, atLeastOnce()).selectOne(any());
+    }
+
     private StudyRecordCreateDTO buildRequest(String rawContent) {
         StudyRecordCreateDTO request = buildRequestWithCategories(List.of("Redis"));
         request.setRawContent(rawContent);
@@ -207,5 +328,40 @@ class StudyRecordServiceTest {
         request.setAiComfort("Noticing the gap is progress.");
         request.setRemark("Need review.");
         return request;
+    }
+
+    private StudyRecordUpdateDTO buildUpdateRequest() {
+        StudyRecordUpdateDTO request = new StudyRecordUpdateDTO();
+        request.setRecordDate(LocalDate.of(2026, 6, 9));
+        request.setRawContent("updated content");
+        request.setDurationMinutes(120);
+        request.setStudyContent("Updated Redis persistence");
+        request.setCategories(List.of("Redis", "Unknown"));
+        request.setWeakPoints(List.of("New weak point"));
+        request.setEmotionStatus("calm");
+        request.setTomorrowPlan("Review AOF rewrite.");
+        request.setAiSummary("Updated summary.");
+        request.setAiComfort("Small progress counts.");
+        request.setRemark("Updated remark.");
+        return request;
+    }
+
+    private StudyRecord savedRecord(Long id, Long userId) {
+        StudyRecord record = new StudyRecord();
+        record.setId(id);
+        record.setUserId(userId);
+        record.setRecordDate(LocalDate.of(2026, 6, 8));
+        record.setRawContent("saved content");
+        record.setDurationMinutes(90);
+        record.setStudyContent("Redis persistence");
+        record.setEmotionStatus("tired");
+        record.setTomorrowPlan("Make a comparison table.");
+        record.setAiSummary("Reviewed Redis persistence.");
+        record.setAiComfort("Noticing the gap is progress.");
+        record.setRemark("Need review.");
+        record.setDeleted(0);
+        record.setCreateTime(LocalDateTime.of(2026, 6, 8, 21, 0));
+        record.setUpdateTime(LocalDateTime.of(2026, 6, 8, 21, 30));
+        return record;
     }
 }
