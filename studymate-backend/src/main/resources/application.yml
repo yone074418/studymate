@@ -33,3 +33,9 @@ studymate:
   jwt:
     secret: studymate-day3-dev-secret-change-before-production
     expiration-seconds: 86400
+  ai:
+    mock-enabled: true
+    api-url: ${STUDYMATE_AI_API_URL:https://api.deepseek.com/anthropic}
+    api-key: ${STUDYMATE_AI_API_KEY:sk-9e87aee4c7b54314ba13d267898c3463}
+    model: ${STUDYMATE_AI_MODEL:deepseek-v4-flash}
+    timeout-ms: ${STUDYMATE_AI_TIMEOUT_MS:10000}

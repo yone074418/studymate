@@ -2,9 +2,14 @@ package com.studymate.module.ai.service.impl;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.studymate.module.ai.client.AiClient;
+import com.studymate.module.ai.client.AiClientException;
+import com.studymate.module.ai.config.AiProperties;
 import com.studymate.module.ai.dto.AiAnalyzeRequestDTO;
 import com.studymate.module.ai.entity.AiCallLog;
 import com.studymate.module.ai.mapper.AiCallLogMapper;
+import com.studymate.module.ai.parser.AiAnalyzeResultParser;
+import com.studymate.module.ai.prompt.StudyRecordPromptBuilder;
 import com.studymate.module.ai.service.AiRecordAnalyzeService;
 import com.studymate.module.ai.vo.AiAnalyzeResultVO;
 import lombok.extern.slf4j.Slf4j;
@@ -20,21 +25,63 @@ public class AiRecordAnalyzeServiceImpl implements AiRecordAnalyzeService {
     private static final String REQUEST_TYPE_RECORD_ANALYZE = "record_analyze";
     private static final String MODEL_NAME_MOCK = "mock";
     private static final int SUCCESS = 1;
+    private static final int FAILED = 0;
 
     private final AiCallLogMapper aiCallLogMapper;
     private final ObjectMapper objectMapper;
+    private final AiProperties aiProperties;
+    private final StudyRecordPromptBuilder promptBuilder;
+    private final AiClient aiClient;
+    private final AiAnalyzeResultParser resultParser;
 
-    public AiRecordAnalyzeServiceImpl(AiCallLogMapper aiCallLogMapper, ObjectMapper objectMapper) {
+    public AiRecordAnalyzeServiceImpl(AiCallLogMapper aiCallLogMapper,
+                                      ObjectMapper objectMapper,
+                                      AiProperties aiProperties,
+                                      StudyRecordPromptBuilder promptBuilder,
+                                      AiClient aiClient,
+                                      AiAnalyzeResultParser resultParser) {
         this.aiCallLogMapper = aiCallLogMapper;
         this.objectMapper = objectMapper;
+        this.aiProperties = aiProperties;
+        this.promptBuilder = promptBuilder;
+        this.aiClient = aiClient;
+        this.resultParser = resultParser;
     }
 
     @Override
     public AiAnalyzeResultVO analyze(Long currentUserId, AiAnalyzeRequestDTO requestDTO) {
         long startTime = System.currentTimeMillis();
-        AiAnalyzeResultVO resultVO = buildMockResult();
-        saveSuccessLog(currentUserId, requestDTO.getRawContent(), resultVO, elapsedMs(startTime));
-        return resultVO;
+        String rawContent = requestDTO.getRawContent();
+        String prompt = promptBuilder.build(rawContent);
+        if (aiProperties.isMockEnabled()) {
+            AiAnalyzeResultVO resultVO = buildMockResult();
+            String mockResponse = toJson(resultVO);
+            saveSuccessLog(currentUserId, prompt, rawContent, mockResponse, modelName(), elapsedMs(startTime));
+            return resultVO;
+        }
+        return analyzeWithRealAi(currentUserId, rawContent, prompt, startTime);
+    }
+
+    private AiAnalyzeResultVO analyzeWithRealAi(Long currentUserId, String rawContent, String prompt, long startTime) {
+        try {
+            String aiResponse = aiClient.chat(prompt);
+            AiAnalyzeResultVO resultVO = resultParser.parse(aiResponse, rawContent);
+            if (!resultParser.canParseJson(aiResponse)) {
+                saveFailureLog(currentUserId, prompt, rawContent, aiResponse, "AI returned non JSON", elapsedMs(startTime));
+                return resultVO;
+            }
+            saveSuccessLog(currentUserId, prompt, rawContent, aiResponse, modelName(), elapsedMs(startTime));
+            return resultVO;
+        } catch (AiClientException exception) {
+            log.warn("AI record analyze request failed, userId={}, error={}", currentUserId, exception.getMessage());
+            saveFailureLog(currentUserId, prompt, rawContent, nullToEmpty(exception.getResponseContent()),
+                    exception.getMessage(), elapsedMs(startTime));
+            return resultParser.parse("", rawContent);
+        } catch (RuntimeException exception) {
+            log.warn("AI record analyze failed, userId={}, error={}", currentUserId, exception.getMessage());
+            saveFailureLog(currentUserId, prompt, rawContent, "", exception.getMessage(), elapsedMs(startTime));
+            return resultParser.parse("", rawContent);
+        }
     }
 
     private AiAnalyzeResultVO buildMockResult() {
@@ -50,15 +97,42 @@ public class AiRecordAnalyzeServiceImpl implements AiRecordAnalyzeService {
         return resultVO;
     }
 
-    private void saveSuccessLog(Long currentUserId, String rawContent, AiAnalyzeResultVO resultVO, int durationMs) {
+    private void saveSuccessLog(Long currentUserId,
+                                String prompt,
+                                String rawContent,
+                                String responseContent,
+                                String modelName,
+                                int durationMs) {
+        saveLog(currentUserId, prompt, rawContent, responseContent, modelName, SUCCESS, null, durationMs);
+    }
+
+    private void saveFailureLog(Long currentUserId,
+                                String prompt,
+                                String rawContent,
+                                String responseContent,
+                                String errorMessage,
+                                int durationMs) {
+        saveLog(currentUserId, prompt, rawContent, responseContent, modelName(), FAILED, errorMessage, durationMs);
+    }
+
+    private void saveLog(Long currentUserId,
+                         String prompt,
+                         String rawContent,
+                         String responseContent,
+                         String modelName,
+                         int success,
+                         String errorMessage,
+                         int durationMs) {
         try {
             AiCallLog aiCallLog = new AiCallLog();
             aiCallLog.setUserId(currentUserId);
             aiCallLog.setRequestType(REQUEST_TYPE_RECORD_ANALYZE);
-            aiCallLog.setModelName(MODEL_NAME_MOCK);
+            aiCallLog.setModelName(modelName);
+            aiCallLog.setPrompt(prompt);
             aiCallLog.setRequestContent(rawContent);
-            aiCallLog.setResponseContent(toJson(resultVO));
-            aiCallLog.setSuccess(SUCCESS);
+            aiCallLog.setResponseContent(responseContent);
+            aiCallLog.setSuccess(success);
+            aiCallLog.setErrorMessage(errorMessage);
             aiCallLog.setDurationMs(durationMs);
             aiCallLog.setCreateTime(LocalDateTime.now());
             aiCallLogMapper.insert(aiCallLog);
@@ -75,6 +149,14 @@ public class AiRecordAnalyzeServiceImpl implements AiRecordAnalyzeService {
             log.warn("Failed to serialize mock AI analyze result", exception);
             return "{}";
         }
+    }
+
+    private String modelName() {
+        return aiProperties.isMockEnabled() ? MODEL_NAME_MOCK : aiProperties.getModel();
+    }
+
+    private String nullToEmpty(String value) {
+        return value == null ? "" : value;
     }
 
     private int elapsedMs(long startTime) {

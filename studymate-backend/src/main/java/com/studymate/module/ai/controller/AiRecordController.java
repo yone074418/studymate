@@ -28,8 +28,8 @@ public class AiRecordController {
     }
 
     @Operation(
-            summary = "Analyze study record with mock AI",
-            description = "Requires login and Bearer Token. Day 7 mock mode returns structured AI analyze result and writes one AI call log for the current user.",
+            summary = "Analyze study record with AI",
+            description = "Requires login and Bearer Token. Supports mock mode and real AI mode, returns a structured analyze result, and writes one AI call log for the current user.",
             security = @SecurityRequirement(name = "bearerAuth")
     )
     @PostMapping("/analyze")
